@@ -1,0 +1,1309 @@
+!apt-get update
+!apt-get install -y tesseract-ocr
+!apt-get install -y tesseract-ocr-spa
+!pip install pytesseract pdf2image pillow PyPDF2
+
+import os
+import re
+import pytesseract
+from PIL import Image
+from pdf2image import convert_from_path
+from PyPDF2 import PdfReader
+import pandas as pd
+from collections import Counter
+import pickle
+from datetime import datetime, timedelta
+import time
+from google.colab import drive
+
+# ======================= CONFIG =======================
+drive.mount('/content/drive')
+ROOT_FOLDER = "/content/drive/Shareddrives/COMERCIAL/COTIZACIONES/Cotizaciones 2026"
+CARPETA_OBJETIVO = None  # None para todas, o número específico
+LIMITE_CARPETAS = 2000  # Nuevo: límite de carpetas a procesar
+MAX_PAGINAS_OCR = 5
+CHECKPOINT_FILE = "/content/drive/MyDrive/checkpoint_cotizaciones_fechas.pkl"
+CONTINUAR_DESDE_CHECKPOINT = None
+
+# ======================= CLAVES =======================
+FACTURA_CLAVES = [
+    "FACTURA", "ENERGIA", "ENERGÍA", "KWH", "TOTAL", "CLIENTE",
+    "CUENTA", "NIU", "NIC", "CÓDIGO", "REGULADAS", "ENEL",
+    "CELSIA", "ELECTROHUILA", "AIR-E", "AIRE", "ELECTROHUILA",
+    "ELECTRIFICADORA", "HUILA"
+]
+
+PROPUESTA_CLAVES = [
+    "PROPUESTA", "COTIZACIÓN", "COTIZACION", "OFERTA",
+    "PRESUPUESTO", "PRESENTACIÓN", "PRESENTACION", "VALOR",
+    "PRECIO", "OFERTA COMERCIAL", "PRESUPUESTO", "COTIZACION",
+    "PRESENTACION TECNICA", "PRESENTACION COMERCIAL", "COMERCIAL",
+    "TÉCNICA", "TECNICA", "ECONÓMICA", "ECONOMICA"
+]
+
+# ======================= ORDEN =======================
+def ordenar_carpetas(lista):
+    def clave(nombre):
+        m = re.match(r"(\d+)", nombre)
+        return int(m.group(1)) if m else 999999
+    return sorted(lista, key=clave)
+
+# ======================= OCR NORMALIZADO =======================
+def normalizar_ocr(texto):
+    if not texto:
+        return ""
+    reemplazos = {
+        "O": "0", "S": "5", "I": "1", "L": "1",
+        "B": "8", "Z": "2", "G": "6", "T": "7"
+    }
+    for k, v in reemplazos.items():
+        texto = re.sub(rf"(?<!\w){k}(?!\w)", v, texto)
+    return texto
+
+# ======================= LECTURA =======================
+def leer_pdf_texto(path):
+    try:
+        reader = PdfReader(path)
+        texto = ""
+        for p in reader.pages:
+            texto += p.extract_text() or ""
+        return texto
+    except Exception as e:
+        print(f"Error leyendo PDF {path}: {e}")
+        return ""
+
+def leer_pdf_ocr(path):
+    try:
+        images = convert_from_path(path, dpi=200, first_page=1, last_page=MAX_PAGINAS_OCR)
+        texto = ""
+        for img in images:
+            texto += pytesseract.image_to_string(img, lang="spa")
+        return normalizar_ocr(texto.upper())
+    except Exception as e:
+        print(f"Error en OCR {path}: {e}")
+        return ""
+
+def leer_imagen(path):
+    try:
+        texto = pytesseract.image_to_string(Image.open(path), lang="spa").upper()
+        return normalizar_ocr(texto)
+    except Exception as e:
+        print(f"Error leyendo imagen {path}: {e}")
+        return ""
+
+# ======================= DETECCIÓN =======================
+def detectar_empresa(texto, nombre_archivo=""):
+    """Detecta la empresa con mejor precisión, considerando nombre de archivo"""
+    if not texto and not nombre_archivo:
+        return None
+
+    texto_upper = texto.upper() if texto else ""
+    nombre_upper = nombre_archivo.upper() if nombre_archivo else ""
+
+    # 1. Primero verificar por nombre de archivo (muy confiable)
+    if "AIR-E" in nombre_upper or "REGULADAS" in nombre_upper or "AIRE" in nombre_upper:
+        return "Air-E"
+    if "ENEL" in nombre_upper:
+        return "Enel"
+    if "CELSIA" in nombre_upper:
+        return "Celsia"
+    if "ELECTROHUILA" in nombre_upper or "HUILA" in nombre_upper:
+        return "ElectroHuila"
+
+    # 2. Verificar por contenido del texto
+    if not texto_upper:
+        return None
+
+    # Detección por contenido
+    indicadores = {
+        "Air-E": 0, "Enel": 0, "ElectroHuila": 0, "Celsia": 0
+    }
+
+    # Palabras clave específicas para cada empresa
+    palabras_clave = {
+        "Air-E": ["AIR-E", "REGULADAS", "AIR E", "OPERADOR DE RED: ALR-E", "AIR E S.A.S"],
+        "Enel": ["ENEL COLOMBIA", "ENEL S.A", "ENEL\nCOLOMBIA", "ENEL ESP", "NIT. 860.063.875-8", "ENEL COLOMBIA S.A. E.S.P"],
+        "ElectroHuila": ["ELECTROHUILA", "ELECTRIFICADORA DEL HUILA", "891.180.001-1", "ELECTRIFICADORA", "HUILA S.A", "VIGILADA POR LA SUPERINTENDENCIA", "ELECTRIFICADORA DEL HUILA S.A ESP"],
+        "Celsia": ["CELSIA", "CELSIA S.A", "CELSIA S.A. E.S.P", "NIT 890.903.847-7"]
+    }
+
+    # Contar ocurrencias
+    for empresa, claves in palabras_clave.items():
+        for clave in claves:
+            if clave in texto_upper:
+                indicadores[empresa] += 1
+
+    # Umbral mínimo para considerar
+    umbral_minimo = 2
+
+    # Verificar si alguna empresa supera el umbral
+    empresas_detectadas = [emp for emp, count in indicadores.items() if count >= umbral_minimo]
+
+    if len(empresas_detectadas) == 1:
+        return empresas_detectadas[0]
+    elif len(empresas_detectadas) > 1:
+        # Si hay empate, devolver la que tenga más indicadores
+        return max(indicadores.items(), key=lambda x: x[1])[0]
+
+    # Fallback a detecciones más simples
+    if "ENEL" in texto_upper and "COLOMBIA" in texto_upper:
+        return "Enel"
+    if "ELECTROHUILA" in texto_upper or "ELECTRIFICADORA DEL HUILA" in texto_upper:
+        return "ElectroHuila"
+    if "AIR-E" in texto_upper or "REGULADAS" in texto_upper:
+        return "Air-E"
+    if "CELSIA" in texto_upper:
+        return "Celsia"
+
+    return None
+
+def parece_factura(texto, nombre_archivo=""):
+    """Detecta si un archivo es factura considerando nombre y contenido"""
+    if not texto and not nombre_archivo:
+        return False
+
+    texto_upper = texto.upper() if texto else ""
+    nombre_upper = nombre_archivo.upper() if nombre_archivo else ""
+
+    # Verificar por nombre de archivo
+    if "FACTURA" in nombre_upper or any(palabra in nombre_upper for palabra in ["ENERGIA", "ELECTRICA", "KWH", "NIU", "NIC"]):
+        return True
+
+    # Si el nombre es puramente numérico y largo (6+ dígitos), podría ser factura nombrada por NIU
+    nombre_sin_ext = os.path.splitext(nombre_archivo)[0] if nombre_archivo else ""
+    if nombre_sin_ext.isdigit() and len(nombre_sin_ext) >= 6:
+        return True
+
+    # Verificar por contenido
+    if not texto_upper:
+        return False
+
+    conteo_palabras = sum(1 for k in FACTURA_CLAVES if k in texto_upper)
+
+    # Si tiene al menos 3 palabras clave, es muy probable que sea factura
+    if conteo_palabras >= 3:
+        return True
+
+    # Patrones específicos de facturas
+    patrones_factura = [
+        r"FACTURA\s+(?:DE\s+)?VENTA",
+        r"TOTAL\s+A\s+PAGAR",
+        r"PERIODO\s+FACTURADO",
+        r"CONSUMO\s+(?:PERIODO|MES)",
+        r"KWH.*?\d+",
+        r"NIU\s*[:\-]\s*\d+",
+        r"NIC\s*[:\-]\s*\d+",
+        r"SU\s+CÓDIGO\s+DE\s+CUENTA",
+        r"ELECTRIFICADORA.*?HUILA",
+        r"ENEL\s+COLOMBIA",
+        r"AIR-E\s+S\.A\.S",
+        r"CELSIA\s+S\.A"
+    ]
+
+    for patron in patrones_factura:
+        if re.search(patron, texto_upper):
+            return True
+
+    return False
+
+def parece_propuesta(texto, nombre_archivo):
+    """Detecta si un archivo es una propuesta/cotización"""
+    if not texto and not nombre_archivo:
+        return False
+
+    texto_upper = texto.upper() if texto else ""
+    nombre_upper = nombre_archivo.upper() if nombre_archivo else ""
+
+    # Verificar por nombre de archivo (prioridad alta)
+    if any(palabra in nombre_upper for palabra in PROPUESTA_CLAVES):
+        return True
+
+    # Si el archivo tiene palabras clave en el nombre
+    if "PROPUESTA" in nombre_upper or "COTIZ" in nombre_upper or "PRESUPUESTO" in nombre_upper:
+        return True
+
+    # Verificar por contenido
+    if not texto_upper:
+        return False
+
+    conteo_palabras = sum(1 for k in PROPUESTA_CLAVES if k in texto_upper)
+    if conteo_palabras >= 2:
+        return True
+
+    # Patrones específicos de propuestas
+    patrones_propuesta = [
+        r"PROPUESTA\s+(?:COMERCIAL|TÉCNICA|ECONÓMICA)",
+        r"COTIZACIÓN\s+NO\.?\s*\d+",
+        r"OFERTA\s+(?:COMERCIAL|ECONÓMICA)",
+        r"PRESUPUESTO\s+NO\.?\s*\d+",
+        r"VALOR\s+TOTAL.*?\$\s*[\d.,]+",
+        r"PRECIO\s+TOTAL.*?\$\s*[\d.,]+",
+        r"PRESENTACIÓN\s+(?:COMERCIAL|TÉCNICA)",
+        r"OFERTA\s+COMERCIAL",
+        r"COTIZACION\s+PARA"
+    ]
+
+    for patron in patrones_propuesta:
+        if re.search(patron, texto_upper):
+            return True
+
+    return False
+
+# ======================= EXTRACCIÓN DE FECHAS DE PROPUESTA MEJORADA =======================
+def obtener_fecha_modificacion_archivo(path):
+    """Obtiene la fecha de modificación del archivo como datetime"""
+    try:
+        # Obtener el tiempo de modificación del archivo
+        timestamp = os.path.getmtime(path)
+        fecha_archivo = datetime.fromtimestamp(timestamp)
+        return fecha_archivo
+    except Exception as e:
+        print(f"Error obteniendo fecha de modificación del archivo {path}: {e}")
+        return None
+
+def parsear_fecha_drive(fecha_str):
+    """Convierte formato '10 ene 2025' a datetime"""
+    try:
+        # Mapeo de meses en español a números
+        meses = {
+            'ene': 1, 'feb': 2, 'mar': 3, 'abr': 4, 'may': 5, 'jun': 6,
+            'jul': 7, 'ago': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dic': 12,
+            'enero': 1, 'febrero': 2, 'marzo': 3, 'abril': 4, 'mayo': 5, 'junio': 6,
+            'julio': 7, 'agosto': 8, 'septiembre': 9, 'octubre': 10, 'noviembre': 11, 'diciembre': 12
+        }
+
+        # Limpiar el texto
+        fecha_str = fecha_str.strip().lower()
+
+        # Intentar diferentes patrones
+        patrones = [
+            r'(\d{1,2})\s+(\w{3,9})\s+(\d{4})',  # 10 ene 2025
+            r'(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})',  # 10/01/2025, 10-01-2025
+            r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',  # 2025-01-10
+        ]
+
+        for patron in patrones:
+            match = re.search(patron, fecha_str)
+            if match:
+                grupos = match.groups()
+
+                if len(grupos) == 3:
+                    # Formato día-mes-año (10 ene 2025)
+                    if grupos[1].isalpha():
+                        dia = int(grupos[0])
+                        mes_str = grupos[1].lower()
+                        anio = int(grupos[2])
+
+                        if mes_str in meses:
+                            mes = meses[mes_str]
+                            return datetime(anio, mes, dia)
+
+                    # Formato día/mes/año (10/01/2025)
+                    elif '/' in fecha_str or '-' in fecha_str:
+                        try:
+                            # Si el primer grupo tiene 4 dígitos, es año-mes-día
+                            if len(grupos[0]) == 4:
+                                anio = int(grupos[0])
+                                mes = int(grupos[1])
+                                dia = int(grupos[2])
+                            else:
+                                # Asumir día-mes-año
+                                dia = int(grupos[0])
+                                mes = int(grupos[1])
+                                anio = int(grupos[2])
+
+                                # Si el año tiene 2 dígitos
+                                if anio < 100:
+                                    anio = 2000 + anio if anio < 50 else 1900 + anio
+
+                            return datetime(anio, mes, dia)
+                        except:
+                            continue
+
+        return None
+    except Exception as e:
+        print(f"Error parseando fecha '{fecha_str}': {e}")
+        return None
+
+def extraer_fecha_propuesta(texto, nombre_archivo, path_archivo):
+    """
+    Extrae la fecha de una propuesta con prioridad:
+    1. Fecha extraída del contenido del texto (dentro del documento)
+    2. Fecha del nombre del archivo
+    3. Fecha de modificación del archivo en Drive (más confiable que creación)
+    """
+    fechas_encontradas = []
+    fuentes_fecha = []
+
+    # 1. Extraer del contenido del texto (si existe) - PRIORIDAD MÁXIMA
+    if texto:
+        fecha_texto = extraer_fecha_de_texto(texto)
+        if fecha_texto:
+            fechas_encontradas.append(fecha_texto)
+            fuentes_fecha.append("contenido_documento")
+
+        # Buscar fechas en contexto específico de propuesta
+        fecha_contexto = extraer_fecha_por_contexto_propuesta(texto)
+        if fecha_contexto and fecha_contexto not in fechas_encontradas:
+            fechas_encontradas.append(fecha_contexto)
+            fuentes_fecha.append("contexto_documento")
+
+    # 2. Extraer del nombre del archivo - PRIORIDAD MEDIA
+    if nombre_archivo:
+        nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+
+        # Buscar fecha en formato "10 ene 2025" en el nombre
+        fecha_nombre_drive = parsear_fecha_drive(nombre_sin_ext)
+        if fecha_nombre_drive:
+            fechas_encontradas.append(fecha_nombre_drive)
+            fuentes_fecha.append("nombre_archivo_drive")
+        else:
+            # Intentar otros formatos en el nombre
+            fecha_nombre_otros = extraer_fecha_de_texto(nombre_sin_ext)
+            if fecha_nombre_otros and fecha_nombre_otros not in fechas_encontradas:
+                fechas_encontradas.append(fecha_nombre_otros)
+                fuentes_fecha.append("nombre_archivo")
+
+    # 3. Obtener fecha de modificación del archivo - PRIORIDAD BAJA (pero confiable)
+    if path_archivo:
+        fecha_modificacion = obtener_fecha_modificacion_archivo(path_archivo)
+        if fecha_modificacion:
+            fechas_encontradas.append(fecha_modificacion)
+            fuentes_fecha.append("fecha_modificacion_drive")
+
+    # Filtrar fechas válidas
+    fechas_validas = []
+    fuentes_validas = []
+    hoy = datetime.now()
+
+    for fecha, fuente in zip(fechas_encontradas, fuentes_fecha):
+        if not fecha:
+            continue
+
+        # Excluir fechas futuras (con margen de 1 día para ajustes de zona horaria)
+        if fecha > hoy + timedelta(days=1):
+            continue
+
+        # Excluir fechas muy antiguas (antes de 2020 para propuestas)
+        if fecha.year < 2020:
+            continue
+
+        fechas_validas.append(fecha)
+        fuentes_validas.append(fuente)
+
+    if fechas_validas:
+        # Ordenar por fecha (más reciente primero)
+        fechas_ordenadas = sorted(zip(fechas_validas, fuentes_validas), key=lambda x: x[0], reverse=True)
+
+        # Tomar la fecha más reciente como fecha de última propuesta
+        fecha_final, fuente_final = fechas_ordenadas[0]
+
+        # Si tenemos múltiples fechas, mostrar todas para referencia
+        if len(fechas_ordenadas) > 1:
+            print(f"  ⓘ Se encontraron {len(fechas_ordenadas)} fechas posibles:")
+            for i, (fecha, fuente) in enumerate(fechas_ordenadas[:3], 1):
+                print(f"    {i}. {fecha.strftime('%d/%m/%Y')} - Fuente: {fuente}")
+
+        return fecha_final, fuente_final
+
+    return None, None
+
+def extraer_fecha_de_texto(texto):
+    """Extrae la primera fecha válida de un texto"""
+    if not texto:
+        return None
+
+    # Primero intentar formato "10 ene 2025" que es común en Drive
+    fecha_drive = parsear_fecha_drive(texto)
+    if fecha_drive:
+        return fecha_drive
+
+    patrones_fecha = [
+        # Formato DD/MM/YYYY o DD-MM-YYYY
+        (r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b", "%d/%m/%Y"),
+        # Formato DD de MES de YYYY
+        (r"\b(\d{1,2})\s+de\s+([A-Z]{3,9})\s+de\s+(\d{4})\b", None),
+        # Formato MES DD, YYYY
+        (r"\b([A-Z]{3,9})\s+(\d{1,2}),?\s+(\d{4})\b", None),
+        # Formato YYYY-MM-DD
+        (r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", "%Y/%m/%d"),
+    ]
+
+    for patron, formato in patrones_fecha:
+        matches = re.finditer(patron, texto.upper())
+        for match in matches:
+            try:
+                if formato == "%d/%m/%Y":
+                    dia, mes, anio = match.groups()
+                    if len(anio) == 2:
+                        anio = "20" + anio if int(anio) >= 25 else "19" + anio
+                    fecha_str = f"{dia}/{mes}/{anio}"
+                    return datetime.strptime(fecha_str, formato)
+
+                elif formato == "%Y/%m/%d":
+                    anio, mes, dia = match.groups()
+                    fecha_str = f"{anio}/{mes}/{dia}"
+                    return datetime.strptime(fecha_str, formato)
+
+                elif patron == r"\b(\d{1,2})\s+de\s+([A-Z]{3,9})\s+de\s+(\d{4})\b":
+                    dia, mes_str, anio = match.groups()
+                    meses = {
+                        "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
+                        "MAYO": 5, "JUNIO": 6, "JULIO": 7, "AGOSTO": 8,
+                        "SEPTIEMBRE": 9, "OCTUBRE": 10, "NOVIEMBRE": 11, "DICIEMBRE": 12
+                    }
+                    if mes_str in meses:
+                        return datetime(int(anio), meses[mes_str], int(dia))
+
+                elif patron == r"\b([A-Z]{3,9})\s+(\d{1,2}),?\s+(\d{4})\b":
+                    mes_str, dia, anio = match.groups()
+                    meses = {
+                        "ENE": 1, "FEB": 2, "MAR": 3, "ABR": 4, "MAY": 5, "JUN": 6,
+                        "JUL": 7, "AGO": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DIC": 12,
+                        "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4, "MAYO": 5,
+                        "JUNIO": 6, "JULIO": 7, "AGO": 8, "SEPTIEMBRE": 9,
+                        "OCTUBRE": 10, "NOVIEMBRE": 11, "DICIEMBRE": 12
+                    }
+                    if mes_str in meses:
+                        return datetime(int(anio), meses[mes_str], int(dia))
+            except ValueError:
+                continue
+
+    return None
+
+def extraer_fecha_por_contexto_propuesta(texto):
+    """Busca fechas cerca de palabras clave específicas de propuestas"""
+    if not texto:
+        return None
+
+    palabras_clave_fecha = [
+        "FECHA", "EMISIÓN", "EMISION", "REALIZADO", "ELABORADO",
+        "PRESENTADO", "GENERADO", "CREADO", "DOCUMENTO", "PROPUESTA",
+        "COTIZACIÓN", "OFERTA", "PRESUPUESTO", "VALIDEZ", "VIGENCIA",
+        "ENTREGA", "ENVÍO", "EMITIDO", "FECHA DE EMISIÓN", "FECHA DE ENTREGA"
+    ]
+
+    lineas = texto.upper().split('\n')
+
+    for i, linea in enumerate(lineas):
+        # Buscar líneas con palabras clave de fecha
+        for palabra in palabras_clave_fecha:
+            if palabra in linea:
+                # Buscar en la línea actual y 2 líneas siguientes
+                for j in range(i, min(len(lineas), i + 3)):
+                    fecha = extraer_fecha_de_texto(lineas[j])
+                    if fecha:
+                        return fecha
+
+    return None
+
+# ======================= EXTRACCIÓN DE CÓDIGOS OPTIMIZADA =======================
+def extraer_enel_optimizado(texto, nombre_archivo=""):
+    """Extrae código de Enel (formato: 5269312-4)"""
+    if not texto:
+        return None
+
+    texto = normalizar_ocr(texto.upper())
+    candidatos = []
+
+    # 1. Buscar en el texto
+    for m in re.findall(r"\b(\d{7})\s*[-\s]\s*(\d)\b", texto):
+        candidatos.append(f"{m[0]}-{m[1]}")
+
+    # Buscar 8 dígitos consecutivos
+    for m in re.findall(r"\b(\d{8})\b", texto):
+        # Verificar contexto
+        idx = texto.find(m)
+        if idx > 0 and texto[idx-1].isdigit():
+            continue
+        if idx + 8 < len(texto) and texto[idx+8].isdigit():
+            continue
+        # Convertir a formato 7-1
+        candidatos.append(f"{m[:-1]}-{m[-1]}")
+
+    # Buscar cerca de palabras clave
+    for m in re.findall(r"(?:NIU|CUENTA|NIT|CÓDIGO|NÚMERO)[^\d]{0,20}(\d{7}\s*[-\s]\s*\d)", texto):
+        candidatos.append(re.sub(r"\s+", "", m))
+
+    # 2. Buscar en nombre de archivo
+    if nombre_archivo:
+        nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+        # Buscar formato 7-1 en nombre
+        m = re.search(r"(\d{7})-(\d)", nombre_sin_ext)
+        if m:
+            candidatos.append(f"{m.group(1)}-{m.group(2)}")
+
+        # Buscar 8 dígitos
+        m = re.search(r"(\d{8})", nombre_sin_ext)
+        if m:
+            candidatos.append(f"{m.group(1)[:-1]}-{m.group(1)[-1]}")
+
+    # Filtrar candidatos
+    candidatos_filtrados = []
+    for c in candidatos:
+        c_clean = re.sub(r"\s+", "", c)
+        # DEBE tener formato 7-1
+        if not re.match(r"^\d{7}-\d$", c_clean):
+            continue
+
+        # Verificar que no sea parte de otra cosa
+        if texto.find(c_clean.replace("-", "")) == -1:
+            # Pero puede venir del nombre del archivo
+            if not nombre_archivo:
+                continue
+
+        candidatos_filtrados.append(c_clean)
+
+    if candidatos_filtrados:
+        conteo = Counter(candidatos_filtrados)
+        ordenados = sorted(conteo.items(), key=lambda x: x[1], reverse=True)
+        codigo = ordenados[0][0]
+
+        # Validar con nombre de archivo
+        if nombre_archivo:
+            nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+            codigo_sin_guion = codigo.replace("-", "")
+
+            # Si el archivo tiene un nombre numérico, verificar coincidencias
+            if nombre_sin_ext.isdigit():
+                if codigo_sin_guion in nombre_sin_ext:
+                    print(f" ✅ NIU {codigo} encontrado en nombre de archivo")
+                elif nombre_sin_ext == codigo_sin_guion:
+                    print(f" ✅ Nombre de archivo es el NIU exacto")
+
+        return codigo
+
+    return None
+
+def extraer_aire_optimizado(texto, nombre_archivo=""):
+    """ Extrae el NIC de Air-E (SIEMPRE 7 dígitos exactos) """
+    if not texto:
+        return None
+
+    texto_upper = texto.upper()
+    candidatos = []
+
+    # PATRÓN 1: NIC explícito - SOLO 7 DÍGITOS EXACTOS
+    patrones_nic = [
+        r"NIC\s*[:\-]\s*(\d{7})\b",
+        r"NIC\s+(\d{7})\b",
+        r"NIC\s*NO\.?\s*[:\-]?\s*(\d{7})\b",
+    ]
+
+    for patron in patrones_nic:
+        matches = re.findall(patron, texto_upper)
+        for match in matches:
+            if len(match) == 7 and match.isdigit():
+                candidatos.append(match)
+
+    # PATRÓN 2: Buscar en líneas con "NIC"
+    lines = texto_upper.split('\n')
+    for line in lines:
+        if "NIC" in line:
+            m = re.search(r"NIC[^\d]*(\d{7})\b", line)
+            if m:
+                num = m.group(1)
+                if num.isdigit() and len(num) == 7:
+                    candidatos.append(num)
+
+    # PATRÓN 3: Buscar número de 7 dígitos con contexto de Air-E
+    if "AIR-E" in texto_upper or "REGULADAS" in texto_upper:
+        # Buscar números de 7 dígitos cerca de palabras clave
+        for match in re.finditer(r"\b(\d{7})\b", texto_upper):
+            num = match.group(1)
+            start = max(0, match.start() - 30)
+            end = min(len(texto_upper), match.end() + 30)
+            contexto = texto_upper[start:end]
+
+            # Verificar contexto
+            if any(palabra in contexto for palabra in ["AIR-E", "REGULADAS", "NIC", "CUENTA"]):
+                # Excluir si es claramente otra cosa
+                if not re.search(r"(?:FECHA|/\d{4}|\$\s*\d|\.\d{2,3}|TOTAL|PAGO)", contexto):
+                    # No puede empezar con 19 o 20 (posibles años)
+                    if not num.startswith(('19', '20')):
+                        candidatos.append(num)
+
+    # PATRÓN 4: Buscar en nombre de archivo
+    if nombre_archivo:
+        nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+        # Si el nombre es exactamente 7 dígitos
+        if nombre_sin_ext.isdigit() and len(nombre_sin_ext) == 7:
+            candidatos.append(nombre_sin_ext)
+
+    # FILTRAR CANDIDATOS: SOLO 7 DÍGITOS
+    candidatos_filtrados = []
+    for c in candidatos:
+        c_str = str(c).strip()
+        if len(c_str) != 7:
+            continue
+        if not c_str.isdigit():
+            continue
+
+        # Validar que no sea un año obvio
+        if c_str.startswith(('19', '20')) and 0 <= int(c_str[2:]) <= 99:
+            # Verificar contexto
+            idx = texto_upper.find(c_str)
+            if idx != -1:
+                contexto = texto_upper[max(0, idx-10):min(idx+10, len(texto_upper))]
+                if "NIC" not in contexto and "CUENTA" not in contexto:
+                    continue
+
+        candidatos_filtrados.append(c_str)
+
+    # SELECCIONAR MEJOR CANDIDATO
+    if candidatos_filtrados:
+        conteo = Counter(candidatos_filtrados)
+        ordenados = sorted(conteo.items(), key=lambda x: x[1], reverse=True)
+        nic = ordenados[0][0]
+
+        # VALIDACIÓN FINAL
+        if nombre_archivo:
+            nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+            if nombre_sin_ext == nic:
+                print(f" ✅ Nombre de archivo es el NIC exacto")
+            elif nombre_sin_ext.isdigit() and nic in nombre_sin_ext:
+                print(f" ✅ NIC {nic} encontrado en nombre de archivo")
+            else:
+                print(f" ✅ NIC {nic} extraído del texto")
+
+        return nic
+
+    # Si no se encontró, pero el nombre del archivo es numérico de 7 dígitos
+    if nombre_archivo:
+        nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+        if nombre_sin_ext.isdigit() and len(nombre_sin_ext) == 7:
+            print(f" ⚠ Usando nombre de archivo como NIC: {nombre_sin_ext}")
+            return nombre_sin_ext
+
+    print(f" ❌ No se encontró NIC de 7 dígitos")
+    return None
+
+def extraer_celsia_optimizado(texto, nombre_archivo=""):
+    """Extrae código de Celsia (normalmente 6 dígitos)"""
+    if not texto:
+        return None
+
+    texto_upper = texto.upper()
+    candidatos = []
+
+    # PATRÓN 1: CÓDIGO DE CLIENTE - 6 DÍGITOS (más común)
+    patrones_celsia = [
+        r"CÓDIGO\s+(?:DEL\s+)?CLIENTE\s*[:\-]?\s*(\d{6})\b",
+        r"CÓDIGO\s+(?:DEL\s+)?USUARIO\s*[:\-]?\s*(\d{6})\b",
+        r"CLIENTE\s*[:\-]?\s*(\d{6})\b",
+        r"USUARIO\s*[:\-]?\s*(\d{6})\b",
+        r"CUENTA\s*[:\-]?\s*(\d{6})\b",
+        r"NIT\s*[:\-]?\s*890\.903\.847-7",  # NIT específico de Celsia
+    ]
+
+    for patron in patrones_celsia:
+        matches = re.findall(patron, texto_upper)
+        for match in matches:
+            # Para el patrón NIT, no agregamos números
+            if patron != r"NIT\s*[:\-]?\s*890\.903\.847-7":
+                if len(match) == 6 and match.isdigit():
+                    candidatos.append(match)
+
+    # PATRÓN 2: Buscar "Celsia" y números cercanos
+    if "CELSIA" in texto_upper:
+        lines = texto_upper.split('\n')
+        for i, line in enumerate(lines):
+            if "CELSIA" in line:
+                # Buscar 6 dígitos en esta línea
+                m = re.search(r"\b(\d{6})\b", line)
+                if m:
+                    num = m.group(1)
+                    if num.isdigit():
+                        candidatos.append(num)
+
+                # Buscar en línea siguiente
+                if i + 1 < len(lines):
+                    m = re.search(r"\b(\d{6})\b", lines[i + 1])
+                    if m:
+                        num = m.group(1)
+                        if num.isdigit():
+                            candidatos.append(num)
+
+    # PATRÓN 3: Buscar números de 6 dígitos en contexto específico
+    # Buscar en toda la factura números de 6 dígitos que no sean fechas/montos
+    for match in re.finditer(r"\b(\d{6})\b", texto_upper):
+        num = match.group(1)
+        start = max(0, match.start() - 20)
+        end = min(len(texto_upper), match.end() + 20)
+        contexto = texto_upper[start:end]
+
+        # Solo considerar si está en contexto relevante
+        if any(palabra in contexto for palabra in ["CELSIA", "CLIENTE", "USUARIO", "CUENTA", "CÓDIGO"]):
+            # Excluir fechas, montos, etc.
+            if not re.search(r"(?:FECHA|/\d{4}|\$\s*\d|\.\d{2,3}|TOTAL|PAGO)", contexto):
+                # No puede ser un año (1900-2099)
+                if not (num.startswith(('19', '20')) and 0 <= int(num[2:]) <= 99):
+                    candidatos.append(num)
+
+    # PATRÓN 4: Buscar en nombre de archivo
+    if nombre_archivo:
+        nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+        # Si el nombre es exactamente 6 dígitos
+        if nombre_sin_ext.isdigit() and len(nombre_sin_ext) == 6:
+            candidatos.append(nombre_sin_ext)
+        # Buscar cualquier subsecuencia de 6 dígitos
+        elif nombre_sin_ext.isdigit() and len(nombre_sin_ext) >= 6:
+            for i in range(len(nombre_sin_ext) - 5):
+                sub_num = nombre_sin_ext[i:i+6]
+                if sub_num.isdigit():
+                    candidatos.append(sub_num)
+
+    # FILTRAR CANDIDATOS
+    candidatos_filtrados = []
+    for c in candidatos:
+        c_str = str(c).strip()
+        # Normalmente 6 dígitos, pero aceptar 5-7 para mayor flexibilidad
+        if len(c_str) < 5 or len(c_str) > 7:
+            continue
+        if not c_str.isdigit():
+            continue
+
+        # Preferir 6 dígitos
+        if len(c_str) == 6:
+            candidatos_filtrados.insert(0, c_str)  # Insertar al inicio para prioridad
+        else:
+            candidatos_filtrados.append(c_str)
+
+    if candidatos_filtrados:
+        # Priorizar candidatos de 6 dígitos
+        candidatos_6digitos = [c for c in candidatos_filtrados if len(c) == 6]
+        if candidatos_6digitos:
+            conteo = Counter(candidatos_6digitos)
+        else:
+            conteo = Counter(candidatos_filtrados)
+
+        ordenados = sorted(conteo.items(), key=lambda x: x[1], reverse=True)
+        codigo = ordenados[0][0]
+
+        # Validar con nombre de archivo
+        if nombre_archivo:
+            nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+            if codigo == nombre_sin_ext:
+                print(f" ✅ Código coincide con nombre de archivo")
+            elif nombre_sin_ext.isdigit() and codigo in nombre_sin_ext:
+                print(f" ✅ Código encontrado en nombre de archivo")
+
+        return codigo
+
+    return None
+
+def extraer_electrohuila_optimizado(texto, nombre_archivo=""):
+    """Extrae código de ElectroHuila (números largos, 8-12 dígitos)"""
+    if not texto:
+        return None
+
+    texto_upper = texto.upper()
+    candidatos = []
+
+    # Patrones específicos de ElectroHuila
+    patrones_eh = [
+        r"SU\s+CÓDIGO\s+DE\s+CUENTA\s+NIU\s*[:\-]?\s*(\d{6,12})",
+        r"NIU\s*[:\-]?\s*(\d{6,12})",
+        r"CUENTA\s*[:\-]?\s*(\d{6,12})",
+        r"\b(\d{8,12})\b(?=.*?ELECTROHUILA)",
+    ]
+
+    for patron in patrones_eh:
+        matches = re.findall(patron, texto_upper)
+        for match in matches:
+            candidatos.append(match)
+
+    # Buscar número largo en contexto específico
+    for match in re.finditer(r"\b(\d{8,12})\b", texto_upper):
+        num = match.group(1)
+        start = max(0, match.start() - 20)
+        end = min(len(texto_upper), match.end() + 20)
+        contexto = texto_upper[start:end]
+
+        # Solo considerar si está cerca de palabras clave
+        if any(palabra in contexto for palabra in ["NIU", "CUENTA", "CÓDIGO", "FACTURA", "ELECTROHUILA"]):
+            # Excluir fechas y montos
+            if not re.search(r"(?:FECHA|/\d{4}|\$\s*\d|\.\d{2,3})", contexto):
+                candidatos.append(num)
+
+    # Buscar en nombre de archivo
+    if nombre_archivo:
+        nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+        # Si el nombre es numérico y largo (posible NIU)
+        if nombre_sin_ext.isdigit() and 8 <= len(nombre_sin_ext) <= 12:
+            candidatos.append(nombre_sin_ext)
+        # Buscar números largos en nombre
+        else:
+            matches = re.findall(r"(\d{8,12})", nombre_sin_ext)
+            for match in matches:
+                if 8 <= len(match) <= 12:
+                    candidatos.append(match)
+
+    # Filtrar candidatos
+    candidatos_filtrados = []
+    for c in candidatos:
+        c_str = str(c).strip()
+        if len(c_str) < 8 or len(c_str) > 12:
+            continue
+        if not c_str.isdigit():
+            continue
+        candidatos_filtrados.append(c_str)
+
+    if candidatos_filtrados:
+        conteo = Counter(candidatos_filtrados)
+        # Ordenar por frecuencia y luego por longitud (más largo primero)
+        ordenados = sorted(conteo.items(), key=lambda x: (x[1], len(x[0])), reverse=True)
+        codigo = ordenados[0][0]
+
+        # Validar con nombre de archivo
+        if nombre_archivo:
+            nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+            if codigo == nombre_sin_ext:
+                print(f" ✅ NIU coincide con nombre de archivo")
+            elif nombre_sin_ext.isdigit() and codigo in nombre_sin_ext:
+                print(f" ✅ NIU encontrado en nombre de archivo")
+
+        return codigo
+
+    # Si no se encontró, pero el nombre del archivo es numérico y largo, usarlo
+    if nombre_archivo:
+        nombre_sin_ext = os.path.splitext(nombre_archivo)[0]
+        if nombre_sin_ext.isdigit() and 8 <= len(nombre_sin_ext) <= 12:
+            print(f" ⚠ Usando nombre de archivo como NIU: {nombre_sin_ext}")
+            return nombre_sin_ext
+
+    return None
+
+def extraer_codigo_empresa(texto, empresa, nombre_archivo=""):
+    """Extrae código según la empresa"""
+    if not texto or not empresa:
+        return None
+
+    codigo = None
+    tipo_codigo = "NIU"  # Valor por defecto
+
+    if empresa == "Enel":
+        codigo = extraer_enel_optimizado(texto, nombre_archivo)
+        tipo_codigo = "NIU"
+    elif empresa == "Air-E":
+        codigo = extraer_aire_optimizado(texto, nombre_archivo)
+        tipo_codigo = "NIC"
+    elif empresa in ["ElectroHuila", "Electrohuila"]:
+        codigo = extraer_electrohuila_optimizado(texto, nombre_archivo)
+        tipo_codigo = "NIU"
+    elif empresa == "Celsia":
+        codigo = extraer_celsia_optimizado(texto, nombre_archivo)
+        tipo_codigo = "CÓDIGO"
+    else:
+        # Búsqueda genérica
+        m = re.search(r"(NIU|NIC|CUENTA|CÓDIGO)[^\d]{0,25}(\d{6,10})", texto, re.IGNORECASE)
+        if m:
+            codigo = m.group(2)
+            tipo_codigo = m.group(1)
+
+    return codigo, tipo_codigo
+
+# ======================= CHECKPOINT =======================
+def cargar_checkpoint():
+    """Carga el checkpoint si existe"""
+    if os.path.exists(CHECKPOINT_FILE) and CONTINUAR_DESDE_CHECKPOINT:
+        try:
+            with open(CHECKPOINT_FILE, 'rb') as f:
+                data = pickle.load(f)
+            print(f"🔄 Checkpoint cargado. Última carpeta: {data.get('ultima_carpeta', 0)}")
+            return data
+        except:
+            print("⚠️ Error cargando checkpoint. Empezando desde cero.")
+            return None
+
+def guardar_checkpoint(data):
+    """Guarda el progreso actual"""
+    with open(CHECKPOINT_FILE, 'wb') as f:
+        pickle.dump(data, f)
+
+# ======================= PROCESO PRINCIPAL CORREGIDO =======================
+def procesar_carpeta(carpeta_path, carpeta_nombre, idx_carpeta):
+    """Procesa una carpeta individual con todas las funcionalidades"""
+    print(f"\n📁 [{idx_carpeta}] Procesando: {carpeta_nombre}")
+    print("-" * 60)
+
+    # Variables para esta carpeta
+    codigos_encontrados = []  # Solo strings, no tuplas
+    empresas_encontradas = set()
+    fecha_propuesta_reciente = None
+    fuente_fecha_propuesta = None
+    archivos_propuesta = []
+    detalles_propuestas = []
+    facturas_procesadas = 0
+    archivos_totales = 0
+    archivos_con_nombre_numerico = []
+
+    # Recorrer archivos
+    for root, _, files in os.walk(carpeta_path):
+        for f in sorted(files):
+            if not f.lower().endswith((".pdf", ".jpg", ".jpeg", ".png")):
+                continue
+
+            archivos_totales += 1
+            path = os.path.join(root, f)
+
+            # Verificar si el nombre del archivo es numérico (posible NIU)
+            nombre_sin_ext = os.path.splitext(f)[0]
+            if nombre_sin_ext.isdigit() and len(nombre_sin_ext) >= 6:
+                archivos_con_nombre_numerico.append(f)
+
+            # Leer archivo
+            if f.lower().endswith('.pdf'):
+                texto = leer_pdf_texto(path)
+                if len(texto.strip()) < 100:
+                    texto = leer_pdf_ocr(path)
+            else:
+                texto = leer_imagen(path)
+
+            if not texto or len(texto.strip()) < 20:
+                continue
+
+            # ===== DETECCIÓN Y PROCESAMIENTO DE PROPUESTAS =====
+            if parece_propuesta(texto, f):
+                archivos_propuesta.append(f)
+                fecha_propuesta, fuente = extraer_fecha_propuesta(texto, f, path)
+
+                if fecha_propuesta:
+                    detalle_propuesta = {
+                        "archivo": f,
+                        "fecha": fecha_propuesta,
+                        "fecha_str": fecha_propuesta.strftime("%d/%m/%Y"),
+                        "fuente": fuente
+                    }
+                    detalles_propuestas.append(detalle_propuesta)
+
+                    # Actualizar la fecha más reciente
+                    if fecha_propuesta_reciente is None or fecha_propuesta > fecha_propuesta_reciente:
+                        fecha_propuesta_reciente = fecha_propuesta
+                        fuente_fecha_propuesta = fuente
+
+                    print(f" 📅 Propuesta: {f}")
+                    print(f" → Fecha: {fecha_propuesta.strftime('%d/%m/%Y')}")
+                    print(f" → Fuente: {fuente}")
+
+            # ===== DETECCIÓN Y PROCESAMIENTO DE FACTURAS =====
+            if parece_factura(texto, f):
+                facturas_procesadas += 1
+                empresa = detectar_empresa(texto, f)
+
+                if empresa:
+                    empresas_encontradas.add(empresa)
+
+                    # Extraer código (devuelve tupla: (codigo, tipo_codigo))
+                    resultado_extraccion = extraer_codigo_empresa(texto, empresa, f)
+
+                    if resultado_extraccion:
+                        codigo, tipo_codigo = resultado_extraccion
+
+                        if codigo:  # Solo si se extrajo un código válido
+                            # Validación inteligente con nombre de archivo
+                            if nombre_sin_ext.isdigit() and len(nombre_sin_ext) >= 6:
+                                # Caso especial: nombre numérico pero diferente del código extraído
+                                if codigo != nombre_sin_ext:
+                                    # Verificar cuál es más confiable
+                                    if empresa == "Air-E" and len(nombre_sin_ext) > 7:
+                                        # Air-E con nombre largo, mantener código de 7 dígitos
+                                        print(f" ⚠ Air-E: Archivo {f} tiene nombre largo ({nombre_sin_ext})")
+                                        print(f" → {tipo_codigo} extraído: {codigo} (mantenido)")
+                                    elif nombre_sin_ext in texto:
+                                        # El nombre aparece en el texto, podría ser el código correcto
+                                        print(f" ⚠ Ajuste: {tipo_codigo} '{codigo}' diferente de nombre '{nombre_sin_ext}'")
+                                        print(f" → Nombre aparece en texto, usando: {nombre_sin_ext}")
+                                        codigo = nombre_sin_ext
+                                    elif codigo in texto:
+                                        # El código extraído aparece en el texto
+                                        print(f" → {tipo_codigo} '{codigo}' encontrado en texto (mantenido)")
+
+                            # Registrar código (solo el string, no la tupla)
+                            if codigo not in codigos_encontrados:
+                                codigos_encontrados.append(codigo)
+
+                            print(f" ✓ Factura: {f}")
+                            print(f" → Empresa: {empresa}")
+                            print(f" → {tipo_codigo}: {codigo}")
+
+                            # Verificar coincidencia con nombre
+                            if codigo == nombre_sin_ext:
+                                print(f" ✅ Coincide con nombre de archivo")
+                            elif nombre_sin_ext.isdigit() and len(nombre_sin_ext) >= 6:
+                                print(f" ⚠ Nombre diferente: {nombre_sin_ext}")
+                        else:
+                            print(f" ⚠ Factura: {f} ({tipo_codigo} duplicado: {codigo})")
+                    else:
+                        # Si no se extrajo código pero el nombre es numérico
+                        if nombre_sin_ext.isdigit() and len(nombre_sin_ext) >= 6:
+                            print(f" ⚠ Factura sin código detectado: {f}")
+                            print(f" → Usando nombre como código: {nombre_sin_ext}")
+                            if nombre_sin_ext not in codigos_encontrados:
+                                codigos_encontrados.append(nombre_sin_ext)
+                        else:
+                            print(f" ✗ Factura sin código: {f}")
+                            print(f" → Empresa: {empresa}")
+                else:
+                    # Si no se encontró código pero el nombre es numérico
+                    if nombre_sin_ext.isdigit() and len(nombre_sin_ext) >= 6:
+                        print(f" ⚠ Factura sin código detectado: {f}")
+                        print(f" → Usando nombre como código: {nombre_sin_ext}")
+                        if nombre_sin_ext not in codigos_encontrados:
+                            codigos_encontrados.append(nombre_sin_ext)
+                    else:
+                        print(f" ✗ Factura sin código: {f}")
+                        print(f" → Empresa: {empresa}")
+
+    # ===== PREPARAR RESULTADOS DE LA CARPETA =====
+    resultado = {
+        "Indice_Carpeta": idx_carpeta,
+        "Nombre_Carpeta": carpeta_nombre,
+        "Facturas_Encontradas": facturas_procesadas,
+        "Archivos_Totales": archivos_totales,
+        "Archivos_Con_Nombre_Numerico": len(archivos_con_nombre_numerico),
+        "Empresas_Detectadas": ", ".join(sorted(empresas_encontradas)) if empresas_encontradas else "No detectadas",
+        "Archivos_Propuesta_Count": len(archivos_propuesta),
+    }
+
+    # Información de propuestas
+    if detalles_propuestas:
+        detalles_propuestas.sort(key=lambda x: x["fecha"], reverse=True)
+        resultado["Fecha_Propuesta_Reciente"] = detalles_propuestas[0]["fecha_str"]
+        resultado["Archivo_Propuesta_Reciente"] = detalles_propuestas[0]["archivo"]
+        resultado["Fuente_Fecha_Propuesta"] = detalles_propuestas[0]["fuente"]
+
+        propuestas_lista = [f"{p['archivo']} ({p['fecha_str']} - {p['fuente']})" for p in detalles_propuestas[:3]]
+        resultado["Propuestas_Encontradas"] = "; ".join(propuestas_lista)
+
+        if len(detalles_propuestas) > 3:
+            resultado["Propuestas_Encontradas"] += f" ... (+{len(detalles_propuestas)-3} más)"
+    else:
+        resultado["Fecha_Propuesta_Reciente"] = None
+        resultado["Archivo_Propuesta_Reciente"] = None
+        resultado["Fuente_Fecha_Propuesta"] = None
+        resultado["Propuestas_Encontradas"] = None
+
+    # Agregar códigos en columnas separadas (SOLO strings)
+    for i, codigo in enumerate(codigos_encontrados[:5], 1):
+        resultado[f"NIU_{i}"] = codigo
+
+    for i in range(len(codigos_encontrados) + 1, 6):
+        resultado[f"NIU_{i}"] = None
+
+    resultado["Total_NIU"] = len(codigos_encontrados)
+
+    # Asegurar que todos los códigos sean strings antes de unirlos
+    codigos_strings = [str(c) for c in codigos_encontrados if c is not None]
+    resultado["NIU_Lista"] = ", ".join(codigos_strings) if codigos_strings else None
+
+    # ===== ESTADÍSTICAS DE LA CARPETA =====
+    print(f"\n 📊 RESUMEN CARPETA '{carpeta_nombre}':")
+    print(f"   Archivos totales: {archivos_totales}")
+    print(f"   Facturas encontradas: {facturas_procesadas}")
+    print(f"   Códigos encontrados: {len(codigos_encontrados)}")
+
+    if facturas_procesadas > 0:
+        exito = (len(codigos_encontrados) / facturas_procesadas) * 100
+        print(f"   Tasa éxito: {exito:.1f}%")
+
+    print(f"   Archivos con nombre numérico: {len(archivos_con_nombre_numerico)}")
+    print(f"   Empresas detectadas: {', '.join(sorted(empresas_encontradas)) if empresas_encontradas else 'Ninguna'}")
+
+    if fecha_propuesta_reciente:
+        print(f"   Propuestas encontradas: {len(archivos_propuesta)}")
+        print(f"   Fecha propuesta más reciente: {fecha_propuesta_reciente.strftime('%d/%m/%Y')}")
+        print(f"   Fuente de la fecha: {fuente_fecha_propuesta}")
+
+    return resultado, len(codigos_encontrados), facturas_procesadas, len(archivos_propuesta)
+
+# ======================= EJECUCIÓN PRINCIPAL =======================
+print("🚀 INICIANDO PROCESAMIENTO OPTIMIZADO DE COTIZACIONES CON EXTRACCIÓN DE FECHAS DE DRIVE")
+print("="*70)
+
+# Cargar checkpoint o empezar de cero
+checkpoint_data = cargar_checkpoint()
+
+if checkpoint_data and CONTINUAR_DESDE_CHECKPOINT:
+    rows = checkpoint_data['rows']
+    stats = checkpoint_data['stats']
+    ultima_procesada = checkpoint_data['ultima_carpeta']
+    print(f"📊 Continuando desde carpeta #{ultima_procesada + 1}")
+else:
+    rows = []
+    stats = {
+        "total_carpetas": 0,
+        "total_facturas": 0,
+        "total_codigos": 0,
+        "total_propuestas": 0,
+        "carpetas_con_propuesta": 0,
+        "carpetas_sin_codigos": 0,
+        "archivos_con_nombre_numerico": 0,
+        "empresas_encontradas": set(),
+        "fuentes_fechas": Counter()
+    }
+    ultima_procesada = 0
+
+# Obtener lista de carpetas
+carpetas = ordenar_carpetas(os.listdir(ROOT_FOLDER))
+print(f"📂 Total de carpetas encontradas: {len(carpetas)}")
+
+# Determinar el rango de carpetas a procesar
+if CARPETA_OBJETIVO is not None:
+    # Si hay una carpeta específica, procesar solo esa
+    carpetas_a_procesar = [CARPETA_OBJETIVO]
+    print(f"🎯 Procesando SOLO carpeta específica #{CARPETA_OBJETIVO}")
+else:
+    # Si no hay carpeta específica, limitar a las primeras N carpetas
+    inicio = ultima_procesada + 1
+    fin = min(len(carpetas), LIMITE_CARPETAS)
+    carpetas_a_procesar = range(inicio, fin + 1)
+    print(f"🔢 Procesando las primeras {LIMITE_CARPETAS} carpetas (del {inicio} al {fin})")
+
+# Procesar carpetas según el modo seleccionado
+for idx in carpetas_a_procesar:
+    if idx > len(carpetas):
+        print(f"⚠️ Carpeta #{idx} no existe. Total de carpetas: {len(carpetas)}")
+        continue
+
+    carpeta_nombre = carpetas[idx-1]
+    carpeta_path = os.path.join(ROOT_FOLDER, carpeta_nombre)
+
+    if not os.path.isdir(carpeta_path):
+        print(f"⚠️ Saltando {carpeta_nombre} (no es carpeta)")
+        continue
+
+    resultado, codigos_encontrados, facturas_carpeta, propuestas_carpeta = procesar_carpeta(
+        carpeta_path, carpeta_nombre, idx
+    )
+
+    # Actualizar estadísticas
+    stats["total_carpetas"] += 1
+    stats["total_facturas"] += facturas_carpeta
+    stats["total_codigos"] += codigos_encontrados
+    stats["total_propuestas"] += propuestas_carpeta
+    stats["archivos_con_nombre_numerico"] += resultado.get("Archivos_Con_Nombre_Numerico", 0)
+
+    empresas_carpeta = resultado.get("Empresas_Detectadas", "")
+    if empresas_carpeta and empresas_carpeta != "No detectadas":
+        for empresa in empresas_carpeta.split(", "):
+            if empresa:
+                stats["empresas_encontradas"].add(empresa)
+
+    if resultado["Fecha_Propuesta_Reciente"]:
+        stats["carpetas_con_propuesta"] += 1
+        fuente_fecha = resultado.get("Fuente_Fecha_Propuesta", "desconocida")
+        stats["fuentes_fechas"][fuente_fecha] += 1
+
+    if codigos_encontrados == 0:
+        stats["carpetas_sin_codigos"] += 1
+
+    rows.append(resultado)
+
+    # Guardar checkpoint
+    checkpoint_data = {
+        'rows': rows,
+        'stats': stats,
+        'ultima_carpeta': idx,
+        'carpetas_totales': len(carpetas),
+        'fecha_checkpoint': datetime.now()
+    }
+    guardar_checkpoint(checkpoint_data)
+
+    print(f"\n💾 Progreso guardado ({idx}/{len(carpetas)})")
+    print("="*70)
+
+# ======================= EXPORTAR RESULTADOS =======================
+print("\n" + "="*70)
+print("📊 CREANDO REPORTE FINAL")
+print("="*70)
+
+# Crear DataFrame
+df = pd.DataFrame(rows)
+
+# Orden de columnas
+column_order = [
+    "Indice_Carpeta",
+    "Nombre_Carpeta",
+    "Fecha_Propuesta_Reciente",
+    "Archivo_Propuesta_Reciente",
+    "Fuente_Fecha_Propuesta",
+    "Propuestas_Encontradas",
+    "Empresas_Detectadas",
+    "Facturas_Encontradas",
+    "Total_NIU",
+    "NIU_Lista",
+    "NIU_1",
+    "NIU_2",
+    "NIU_3",
+    "NIU_4",
+    "NIU_5",
+    "Archivos_Con_Nombre_Numerico",
+    "Archivos_Propuesta_Count",
+    "Archivos_Totales"
+]
+
+existing_columns = [col for col in column_order if col in df.columns]
+remaining_columns = [col for col in df.columns if col not in existing_columns]
+df = df[existing_columns + remaining_columns]
+
+# Guardar resultados
+os.makedirs("/content/drive/MyDrive", exist_ok=True)
+output_excel = "/content/drive/MyDrive/reporte_cotizaciones_fechas_drive.xlsx"
+output_csv = "/content/drive/MyDrive/reporte_cotizaciones_fechas_drive.csv"
+
+df.to_excel(output_excel, index=False)
+df.to_csv(output_csv, index=False, encoding='utf-8')
+
+# ======================= ESTADÍSTICAS FINALES =======================
+print("\n✅ PROCESO COMPLETADO")
+print("="*70)
+print(f"📊 ESTADÍSTICAS FINALES:")
+print(f"   Carpetas procesadas: {stats['total_carpetas']}/{len(carpetas)}")
+print(f"   Facturas encontradas: {stats['total_facturas']}")
+print(f"   Códigos extraídos: {stats['total_codigos']}")
+print(f"   Propuestas encontradas: {stats['total_propuestas']}")
+print(f"   Carpetas con propuesta: {stats['carpetas_con_propuesta']}")
+print(f"   Carpetas sin códigos: {stats['carpetas_sin_codigos']}")
+print(f"   Archivos con nombre numérico: {stats['archivos_con_nombre_numerico']}")
+print(f"   Empresas encontradas: {', '.join(sorted(stats['empresas_encontradas']))}")
+
+if stats['total_facturas'] > 0:
+    tasa_exito = (stats['total_codigos'] / stats['total_facturas']) * 100
+    print(f"   Tasa de éxito global: {tasa_exito:.1f}%")
+
+print(f"\n📅 DISTRIBUCIÓN DE FUENTES DE FECHAS DE PROPUESTA:")
+for fuente, cantidad in stats['fuentes_fechas'].most_common():
+    print(f"   {fuente}: {cantidad} carpetas")
+
+print(f"\n💾 ARCHIVOS GENERADOS:")
+print(f"   Excel: {output_excel}")
+print(f"   CSV: {output_csv}")
+
+# Mostrar resumen
+print("\n📋 RESUMEN (primeras 10 carpetas):")
+summary_cols = [
+    "Indice_Carpeta",
+    "Nombre_Carpeta",
+    "Fecha_Propuesta_Reciente",
+    "Fuente_Fecha_Propuesta",
+    "Empresas_Detectadas",
+    "Facturas_Encontradas",
+    "Total_NIU",
+    "NIU_1",
+    "NIU_2",
+    "NIU_3"
+]
+
+if all(col in df.columns for col in summary_cols):
+    print(df[summary_cols].head(10).to_string(index=False))
+
+# Eliminar checkpoint si terminó completamente
+if CARPETA_OBJETIVO is None and stats['total_carpetas'] >= LIMITE_CARPETAS:
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+        print("\n🗑️ Checkpoint eliminado (límite de carpetas alcanzado)")
+elif CARPETA_OBJETIVO is not None:
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+        print("\n🗑️ Checkpoint eliminado (carpeta específica procesada)")
