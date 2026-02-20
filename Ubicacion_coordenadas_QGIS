@@ -1,0 +1,33 @@
+import processing
+from qgis.core import QgsProject, QgsVectorLayer
+
+# Obtener la capa original
+layer = QgsProject.instance().mapLayersByName("CONSUMIDORES DE ENERGIA")[0]
+
+# IDs que ya fueron contactados
+ids_contactados = [23,52,54,65,271,273,281,292,293,72,77,83,96,104,120,122,134,147,156,167,172,177,183,186,187,201,206,214,256]   # <-- cambia estos números por los reales
+
+# Crear expresión de filtro
+expresion = f'"id" IN ({",".join(map(str, ids_contactados))})'
+
+# Opción 1: Guardar solo como GeoPackage (recomendada)
+output_path = 'C:/Users/Lenovo/Documents/01 - SIG/01 - SIG - SHP/Contactados/contactados_JMiguel.gpkg'
+
+# Ejecutar extracción y guardar capa permanente
+result = processing.run("native:extractbyexpression", {
+    'INPUT': layer,
+    'EXPRESSION': expresion,
+    'OUTPUT': output_path
+})
+
+# Opcional: Cargar la capa resultante al proyecto
+if result and 'OUTPUT' in result:
+    result_layer = QgsVectorLayer(result['OUTPUT'], 'Contactados_JMiguel', 'ogr')
+    if result_layer.isValid():
+        QgsProject.instance().addMapLayer(result_layer)
+        print("¡Capa creada y cargada exitosamente!")
+    else:
+        print("Error: No se pudo cargar la capa resultante")
+else:
+    print("Error: No se pudo crear la capa")
+
